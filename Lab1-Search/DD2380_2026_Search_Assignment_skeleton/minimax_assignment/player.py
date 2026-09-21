@@ -104,12 +104,7 @@ class PlayerControllerMinimax(PlayerController):
 
         gc.collect()
 
-        # A new table for every move. The keys use node.depth, which is
-        # counted from THIS move's root, so an entry from the previous move
-        # would describe a different moment in the observation sequence.
-        # Within one move the table is shared by all iterations of the
-        # iterative deepening, which is what makes its best moves useful for
-        # ordering the next, deeper iteration.
+        # A new table for every move. 
         self._table = {}
 
         # Edge case: the root is already terminal, no move matters.
@@ -181,9 +176,7 @@ class PlayerControllerMinimax(PlayerController):
         if time.perf_counter() > self._deadline:
             raise SearchTimeout()
 
-        # (a) Terminal state -> exact utility. Checked before the depth test:
-        #     a game that ends exactly at the cut-off has a known result and
-        #     must not be scored as if play continued.
+        # (a) Terminal state -> exact utility.
         if self._is_terminal(node):
             return self._utility(node.state)
 
@@ -191,12 +184,7 @@ class PlayerControllerMinimax(PlayerController):
         if depth_left == 0:
             return self._evaluate(node.state)
 
-        # (c) Transposition table lookup. Many move orders reach the same
-        #     state (e.g. up-then-left and left-then-up; fish move the same
-        #     way whatever the hooks do): measured, 93% of the nodes at
-        #     depth 5 are repeats. A stored result is reused only if it was
-        #     searched at least as deep as needed now, and a bound only if it
-        #     already decides this node for the current window.
+        # (c) Transposition table lookup. 
         key = self._state_key(node)
         entry = self._table.get(key)
         tt_move = None
@@ -210,10 +198,7 @@ class PlayerControllerMinimax(PlayerController):
                 if entry_type == self.UPPER and entry_value <= alpha:
                     return entry_value
 
-        # (d) Expand. The best move stored for this state (usually by the
-        #     previous, shallower iteration) is searched first: alpha-beta
-        #     prunes most when the best move comes first. This extends the
-        #     root-only ordering to every node.
+        # (d) Expand. 
         children = self._order_children(
             node.compute_and_get_children(), tt_move)
         margin = self._margin(node.state)
@@ -249,9 +234,7 @@ class PlayerControllerMinimax(PlayerController):
                     break
 
         # (f) Store, recording what kind of value this is relative to the
-        #     window the node was searched with. Only completed nodes reach
-        #     this line: a SearchTimeout unwinds past it, so an interrupted
-        #     search never leaves a wrong entry behind.
+        #     window the node was searched with. 
         if value <= alpha_orig:
             entry_type = self.UPPER
         elif value >= beta_orig:
@@ -273,14 +256,11 @@ class PlayerControllerMinimax(PlayerController):
         """
         Two nodes may share a table entry only if everything that affects the
         search below them is equal:
-          * node.depth - the position in the observation sequence, i.e. how
-            the fish will move from here; the same board at another depth
-            has a different future
+          * node.depth
           * the player to move (implied by the depth, kept for safety)
           * both hook positions and the fish on each line
-          * the score margin - evaluation and utility are relative to it
-          * the remaining fish and their positions (a frozenset, so the
-            order of the dictionary does not matter)
+          * the score margin
+          * the remaining fish and their positions 
         Not included: the fish values (constant during the game) and the
         path to the node (the future does not depend on it).
         """
@@ -310,11 +290,6 @@ class PlayerControllerMinimax(PlayerController):
     #  Exact utility of a terminal state, gamma(A, s)
     # ----------------------------------------------------------------------
     def _utility(self, state):
-        """
-        The game is over, so the scores on the board are the final scores and
-        there is no future catch to account for. From MAX's point of view a
-        positive margin is a win, a negative one a loss, zero a draw.
-        """
         score_p0, score_p1 = state.get_player_scores()
         return score_p0 - score_p1
 
