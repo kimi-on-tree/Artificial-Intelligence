@@ -2,11 +2,15 @@
 
 ## J0
 
-name1: Mo Kong
+Name1: Mo Kong
 
-email1: mkong@kth.se
+Email1: mkong@kth.se
 
-name2: None
+Name2: None
+
+Submission: 20484323
+
+
 
 ## J1
 
