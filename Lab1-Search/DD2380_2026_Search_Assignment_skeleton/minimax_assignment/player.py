@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import gc
+import time
+
 from fishing_game_core.game_tree import Node
 from fishing_game_core.player_utils import PlayerController
 from fishing_game_core.shared import ACTION_TO_STR
@@ -23,35 +26,48 @@ class PlayerControllerHuman(PlayerController):
 
 
 # ==========================================================================
-#  Stage 2: fixed-depth minimax with alpha-beta pruning.
-#  Targets the C requirement: a correct minimax search combined with a
-#  technique that lets it search effectively under the time limit.
+#  Stage 3: iterative deepening alpha-beta under a time budget.
 # ==========================================================================
+
+class SearchTimeout(Exception):
+    """
+    Raised inside the recursion when the time budget is spent.
+
+    An exception is used instead of a return value because the search can be
+    many calls deep when time runs out. The exception unwinds all of them at
+    once, and no half-finished value can leak into a decision: the result of
+    the interrupted iteration is simply never used.
+    """
+    pass
+
 
 class PlayerControllerMinimax(PlayerController):
 
-    # Fixed search depth (root = depth 0, +1 per transition).
-    #
-    # Measured on 93 positions from the four test scenarios, worst move time:
-    #     depth 4: 28 ms    depth 5: 36 ms    depth 6: 97 ms (over 75 ms)
-    # Depth 5 is the deepest that stays at about half the budget, leaving a
-    # margin for a slower judge machine. Plain minimax without pruning could
-    # only afford depth 4 (worst 34 ms), and only after the terminal-test fix
-    # below; before that fix it could only afford depth 3.
-    #
-    # The depth is still chosen for the WORST position, so most moves finish
-    # far below the limit (depth 5 averages 11 ms). Stage 3 replaces this
-    # constant with iterative deepening under a time budget.
-    MAX_DEPTH = 5
+    # Time budget for one move, in seconds. The hard limit is 75 ms, but the
+    # budget has to leave room for work outside the search: building the
+    # root Node from the message, sending the answer back, the time between
+    # the last deadline check and the moment the exception reaches the top,
+    # and a judge machine that may be slower than this one.
+    TIME_BUDGET = 55e-3
 
     def __init__(self):
         super(PlayerControllerMinimax, self).__init__()
+        # Absolute time (perf_counter) at which the current search must stop.
+        self._deadline = 0.0
 
     def player_loop(self):
         """
         Main loop for the minimax next move search.
         :return:
         """
+
+        # Turn off automatic garbage collection for the whole game. The game
+        # tree is full of reference cycles (Node.parent <-> Node.children)
+        # that only the cyclic collector can free, and left on automatic it
+        # starts at arbitrary moments - often in the middle of a search.
+        # Instead, search_best_next_move() collects once per move, at a fixed
+        # point, and counts that time against the move's budget.
+        gc.disable()
 
         # Generate first message (Do not remove this line!)
         first_msg = self.receiver()
@@ -68,48 +84,130 @@ class PlayerControllerMinimax(PlayerController):
             # Execute next action
             self.sender({"action": best_move, "search_time": None})
 
+
     # ----------------------------------------------------------------------
-    #  Entry point. The root is a MAX node: the green player (player 0) moves.
+    #  Entry point: iterative deepening
     # ----------------------------------------------------------------------
     def search_best_next_move(self, initial_tree_node):
         """
-        Evaluate the children of the root with alpha-beta and play the move
-        with the highest value.
+        Run a complete alpha-beta search to depth 1, then depth 2, then 3, ...
+        until the time budget runs out, and play the best move of the DEEPEST
+        ITERATION THAT FINISHED.
 
-        The root is itself a MAX node, so it takes part in the pruning: once
-        the first child has been searched, its value becomes alpha, and every
-        later child is searched with the window (alpha, +inf). Inside such a
-        child, as soon as red finds a reply that holds green to <= alpha, the
-        rest of that child is skipped - green already has a move that is at
-        least that good.
+        Why this replaces the fixed depth of stage 2:
+          * The depth adapts to the position. Simple positions (few fish, a
+            hooked fish forcing "up") reach much deeper; hard ones stop early
+            instead of overrunning the 75 ms limit.
+          * There is always an answer ready. Depth 1 finishes in well under a
+            millisecond, and each later iteration only replaces the answer
+            once it has completed.
 
-        beta stays +inf at the root because nothing above the root can
-        restrict what MAX is allowed to achieve.
+        Why repeating the shallow iterations is cheap:
+          * The game tree grows by a factor of about 5 per ply, so all the
+            shallower iterations together cost roughly a quarter of the last
+            one.
+          * Node caches its children (compute_and_get_children), so the next
+            iteration walks through states that were already generated and
+            only pays for the new bottom layer.
+          * The previous iteration tells us which root move is probably best,
+            and it is searched first (see _order_root_children).
 
         :param initial_tree_node: game_tree.Node, the root, depth == 0
         :return: one of "stay", "up", "down", "left", "right"
         """
+        self._deadline = time.perf_counter() + self.TIME_BUDGET
+
+        # Free the previous move's game tree. This is done here, AFTER the
+        # deadline has been fixed, so its cost is paid out of this move's
+        # budget: a slow collection shortens the search instead of pushing
+        # the answer past the limit.
+        #
+        # An earlier version collected right after sending the answer,
+        # assuming that time was free. It is not: the judge replies quickly,
+        # so the next message arrives while the collection is still running,
+        # and that delay counts against the next move. A collection takes
+        # 17 ms on average and up to 33 ms here, so search + collection
+        # reached 92 ms. That is the likely cause of the one run-time error
+        # on Kattis (24/25 passed).
+        gc.collect()
+
         # Edge case: the root is already terminal, no move matters.
         if self._is_terminal(initial_tree_node):
             return ACTION_TO_STR[0]  # "stay"
 
         children = initial_tree_node.compute_and_get_children()
 
-        alpha = float("-inf")
-        beta = float("inf")
+        # Fallback in case not even depth 1 completes.
         best_move = children[0].move
 
-        for child in children:
-            value = self._alphabeta(child, self.MAX_DEPTH - 1, alpha, beta)
-            # Strict '>' keeps the first of several equally good moves. This
-            # matters with pruning: a later child that was cut off returns a
-            # BOUND (<= alpha), not its exact value, so it must never replace
-            # the current best on a tie.
+        # Searching deeper than the end of the observation sequence is
+        # pointless: every branch is terminal by then.
+        max_useful_depth = (len(initial_tree_node.observations)
+                            - initial_tree_node.depth)
+
+        depth = 1
+        while depth <= max_useful_depth:
+            try:
+                best_move = self._search_root(children, depth, best_move)
+            except SearchTimeout:
+                # The unfinished iteration is discarded entirely. Its partial
+                # result only reflects the root moves it got to, so it could
+                # prefer a move merely because the better one was never
+                # reached.
+                break
+            depth += 1
+
+        return ACTION_TO_STR[best_move]
+
+    def _search_root(self, children, depth, previous_best):
+        """
+        One complete alpha-beta iteration to the given depth.
+
+        :param children: the root's children
+        :param depth: search depth of this iteration
+        :param previous_best: best move of the previous iteration, searched
+                              first
+        :return: the best move (int) at this depth
+        :raises SearchTimeout: if the budget runs out before it finishes
+        """
+        alpha = float("-inf")
+        beta = float("inf")
+        ordered = self._order_root_children(children, previous_best)
+        best_move = ordered[0].move
+
+        for child in ordered:
+            value = self._alphabeta(child, depth - 1, alpha, beta)
+            # Strict '>': a later child that was cut off returns a BOUND
+            # (<= alpha), not its exact value, so it must never replace the
+            # current best on a tie.
             if value > alpha:
                 alpha = value
                 best_move = child.move
 
-        return ACTION_TO_STR[best_move]
+        return best_move
+
+    def _order_root_children(self, children, previous_best):
+        """
+        Put the previous iteration's best move first; keep the rest in order.
+
+        Alpha-beta prunes most when the best move is searched first: its
+        value becomes alpha immediately, and every other root move can then
+        be refuted by red's first good reply instead of being searched in
+        full. The best move at depth d-1 is very often still the best at
+        depth d, so it is the cheapest good guess available.
+
+        Ordering never changes the minimax value, only how much is pruned.
+
+        Measured effect in this stage is small (average completed depth 6.75
+        with it, 6.73 without, on 93 test positions). Two reasons: it only
+        reorders the root, while most of the tree lies below it; and with the
+        flat score-difference evaluation most moves tie at the same value, so
+        there is rarely a clearly best move to put first. Stage 5 extends the
+        idea to every node via the transposition table.
+        """
+        first = [c for c in children if c.move == previous_best]
+        rest = [c for c in children if c.move != previous_best]
+        return first + rest
 
     # ----------------------------------------------------------------------
     #  Recursion: minimax with alpha-beta pruning
@@ -141,6 +239,13 @@ class PlayerControllerMinimax(PlayerController):
         :param beta: upper bound, the value MIN can already force
         :return: float
         """
+        # Abort the whole iteration once the budget is spent. Checked at every
+        # node: the check costs far less than generating one state, and a
+        # coarser check (e.g. every N nodes) would make the overshoot past
+        # the deadline depend on how expensive those N nodes happen to be.
+        if time.perf_counter() > self._deadline:
+            raise SearchTimeout()
+
         # (a) Terminal state -> exact utility. Checked before the depth test:
         #     a game that ends exactly at the cut-off has a known result and
         #     must not be scored as if play continued.
