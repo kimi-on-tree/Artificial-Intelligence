@@ -6,7 +6,7 @@ name1: Mo Kong
 
 email1: mkong@kth.se
 
-namme2: None
+name2: None
 
 ## J1
 
