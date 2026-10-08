@@ -50,7 +50,7 @@ class PlayerControllerMinimax(PlayerController):
     #
     HOOKED_WEIGHT = 0.9
     PROXIMITY_WEIGHT = 0.3
-    EARLY_BONUS = 1e-3
+    EARLY_BONUS = 0.03
     BOARD_SIZE = 20
     SURFACE_Y = 19
 
